@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"math/rand"
 	"sort"
 	"sync"
@@ -27,6 +28,7 @@ import (
 	"time"
 
 	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -62,11 +64,13 @@ const (
 
 // 用于标记尚未投票的状态
 const NonVote int = -1
+const NonExistTerm int = -2
 
 // 时间参数
 const (
 	HeartBeatPeriod      = time.Millisecond * 120 // 心跳周期
-	SleepTime            = time.Millisecond * 100 // ticker睡眠时间
+	TickerSleepTime      = time.Millisecond * 70  // ticker睡眠时间
+	AgreeSleepTime       = time.Millisecond * 20  // argeement睡眠时间
 	ElectionTimeOut      = time.Millisecond * 250 // 选举超时时间
 	ElectionTimeInterval = 200                    // 随机选举超时范围
 )
@@ -120,7 +124,6 @@ type Raft struct {
 	timeOut time.Time //用于记录下一次选举超时时间
 
 	applyCond *sync.Cond // 用于叫醒apply线程的条件变量
-	agreeCond *sync.Cond // 用于叫醒agree线程的条件变量
 }
 
 // return currentTerm and whether this server
@@ -150,13 +153,15 @@ func (rf *Raft) setState(state raftState) {
 // see paper's Figure 2 for a description of what should be persistent.
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.voteFor)
+	e.Encode(rf.log)
+
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
@@ -165,18 +170,20 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var voteFor int
+	var log []Entry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&voteFor) != nil ||
+		d.Decode(&log) != nil {
+		println("Read Failed!")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.voteFor = voteFor
+		rf.log = log
+	}
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -220,13 +227,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer rf.persist() // 每次RPC返回前都需要持久化数据
 
 	// 拒绝所有term小于自身的请求
 	if args.Term < rf.currentTerm {
 		reply.Term, reply.VoteGranted = rf.currentTerm, false
 		return
 	}
+	defer rf.persist() // RPC 返回前持久化
 	// 对所有term大于自身的请求，更新自身的term，并变为follower状态
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
@@ -294,21 +301,24 @@ type AppendEntryArgs struct {
 }
 
 type AppendEntryReply struct {
-	Term    int
-	Success bool
+	Term        int
+	Success     bool
+	ConfictTerm int
+	FirstIndex  int
 }
 
 // AppendEntry RPC Handler
 func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer rf.persist() // 每次RPC返回前都要持久化数据
 
 	// 拒绝所有term小于自身的请求
 	if args.Term < rf.currentTerm {
 		reply.Term, reply.Success = rf.currentTerm, false
 		return
 	}
+	defer rf.persist() // 每次RPC返回前都要持久化数据
+
 	// 如果term大于自身，则更新自身，并变为follower状态
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
@@ -320,8 +330,21 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		rf.setState(FollowerState)
 	}
 	// 如果PrevLog不匹配, 返回false
-	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	// lab2C 优化， 同时返回冲突的term和冲突的term的第一条index
+	if args.PrevLogIndex >= len(rf.log) {
 		reply.Term, reply.Success = rf.currentTerm, false
+		reply.ConfictTerm = NonExistTerm
+		reply.FirstIndex = len(rf.log)
+		return
+	} else if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Term, reply.Success = rf.currentTerm, false
+		reply.ConfictTerm = rf.log[args.PrevLogIndex].Term
+		for _, entry := range rf.log {
+			if entry.Term == reply.ConfictTerm {
+				reply.FirstIndex = entry.Index
+				break
+			}
+		}
 		return
 	}
 	// 如果和新来的entry产生冲突，删除这条及之后的log
@@ -388,7 +411,7 @@ func (rf *Raft) argeeWithServer(server int, currentTerm int) {
 
 		rf.mu.Unlock()
 
-		// 如果RPC失败就不管了
+		// 如果RPC失败不管他
 		if !rf.sendAppendEntry(server, args, reply) {
 			return
 		}
@@ -398,6 +421,7 @@ func (rf *Raft) argeeWithServer(server int, currentTerm int) {
 		if reply.Term > rf.currentTerm {
 			rf.currentTerm = reply.Term
 			rf.setState(FollowerState)
+			rf.persist()
 			rf.mu.Unlock()
 			return
 		}
@@ -412,7 +436,20 @@ func (rf *Raft) argeeWithServer(server int, currentTerm int) {
 			break
 		}
 		// 如果失败了,就将nextIndex减1
-		rf.nextIndex[server] = args.PrevLogIndex
+		// lab2C 优化：根据返回的conflict term和first index优化
+		// 两种情况：1、Leader没有这个term的entry，那么直接将Leader的First index返回过来， 后面的必然全部冲突
+		// 2、如果Leader有这个term，说明Leader在这个term的entry比follower少，那直接把Leader这个term的后一条拿过来就可以了
+		rf.nextIndex[server] = reply.FirstIndex
+		nice := false
+		for _, entry := range rf.log {
+			if entry.Term == reply.ConfictTerm {
+				nice = true
+			}
+			if nice && entry.Term != reply.ConfictTerm {
+				rf.nextIndex[server] = entry.Index
+				break
+			}
+		}
 		rf.mu.Unlock()
 	}
 
@@ -453,8 +490,9 @@ func (rf *Raft) agreement() {
 			go rf.argeeWithServer(i, rf.currentTerm)
 		}
 
-		rf.agreeCond.Wait()
 		rf.mu.Unlock()
+		// 每隔一段时间做一次
+		time.Sleep(AgreeSleepTime)
 	}
 }
 
@@ -492,9 +530,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// 后面会使用他们判断是否commit
 	rf.nextIndex[rf.me] = index + 1
 	rf.matchIndex[rf.me] = index
-
+	rf.persist()
 	// 叫醒agree线程
-	rf.agreeCond.Signal()
+
+	// 收到client新的请求立马和所有server同步
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go rf.argeeWithServer(i, rf.currentTerm)
+	}
 
 	return index, term, isLeader
 }
@@ -534,7 +579,7 @@ func (rf *Raft) ticker() {
 		}
 		rf.mu.Unlock()
 		// 睡一会待会再检查
-		time.Sleep(SleepTime)
+		time.Sleep(TickerSleepTime)
 	}
 }
 
@@ -552,6 +597,7 @@ func (rf *Raft) sendHeartBeat(server int, args *AppendEntryArgs) {
 	if reply.Term > rf.currentTerm {
 		rf.currentTerm = reply.Term
 		rf.setState(FollowerState)
+		rf.persist()
 	}
 }
 
@@ -604,6 +650,7 @@ func (rf *Raft) getVotes(server int, args *RequestVoteArgs, votes *int, done *bo
 	if reply.Term > rf.currentTerm {
 		rf.currentTerm = reply.Term
 		rf.setState(FollowerState)
+		rf.persist()
 		return
 	}
 	// 没得票直接返回
@@ -639,6 +686,7 @@ func (rf *Raft) election() {
 	rf.setState(CandidateState)
 	rf.currentTerm++
 	rf.voteFor = rf.me
+	rf.persist()
 	// 用于记录票数和是否当选
 	votes := 1
 	done := false
@@ -710,7 +758,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(peers))
 	rf.timeOut = time.Now().Add(getRandTimeOut())
 	rf.applyCond = sync.NewCond(&rf.mu)
-	rf.agreeCond = sync.NewCond(&rf.mu)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
